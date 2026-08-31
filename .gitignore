@@ -1,0 +1,22 @@
+# Local configuration and credentials
+*.env
+*.env.*
+!.env.example
+configs/*.local.toml
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.DS_Store
+
+# Runtime state and generated artifacts
+runtime/
+*.log
+.ipynb_checkpoints/

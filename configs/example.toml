@@ -1,0 +1,53 @@
+[project]
+run_dir = "/path/to/dpgen/run"
+output_dir = "/path/to/dpgen-monitor-output"
+check_interval = 300
+# 状态不变时保持静默；仅按该间隔输出健康心跳。0 表示关闭。
+heartbeat_interval = 21600
+
+[dpgen]
+log_file = "dpgen.log"
+record_file = "record.dpgen"
+statistics_task = 6
+# 首次接入已有项目时，可设置为下一轮，避免补发全部历史通知。
+statistics_start_iteration = 0
+
+[evaluation]
+enabled = true
+backend = "deepmd"
+command = ["conda", "run", "-n", "deepmd", "dp"]
+model_ids = ["000", "001", "002", "003"]
+model_file = "frozen_model.pb"
+# 支持 {iteration} 和 {previous_iteration}；默认做上一轮新增数据吸收评估。
+test_data = "data.iters/iter.{previous_iteration:06d}/02.fp/data.000"
+# iter.000000 没有上一轮时使用。
+initial_test_data = "data.init/03.data"
+# true 会额外运行上一轮的四个模型，计算成本约增加一倍。
+compare_previous_model = true
+num_test = 30
+# 首次接入已有项目时，建议设置为下一轮。
+start_iteration = 0
+# 上一轮 FP 吸收评估在训练完成后执行。
+absorption_ready_task = 2
+# 本轮 FP 盲区评估在 post_fp 完成、FP 数据目录存在后执行。
+blind_spot_enabled = true
+blind_spot_ready_task = 8
+
+[[notifications]]
+name = "terminal"
+type = "console"
+
+# 通用 JSON Webhook 示例：
+# [[notifications]]
+# name = "automation-webhook"
+# type = "webhook"
+# url_env = "DPGEN_MONITOR_WEBHOOK_URL"
+# timeout = 15
+
+# 飞书示例（密钥只从环境变量读取）：
+# [[notifications]]
+# name = "feishu"
+# type = "feishu"
+# bot_url_env = "FEISHU_BOT_URL"
+# app_id_env = "FEISHU_APP_ID"
+# app_secret_env = "FEISHU_APP_SECRET"
