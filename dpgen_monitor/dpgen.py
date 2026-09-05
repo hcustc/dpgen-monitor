@@ -22,6 +22,8 @@ class IterationSnapshot:
     iteration_dir: Path
     train_dir: Path | None
     task: int | None
+    source_identity: str = ""
+    generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -88,12 +90,14 @@ class DpgenObserver:
             ]
             task = max(task_values) if task_values else None
             train_dir = iteration_dir / "00.train"
+            stat = iteration_dir.stat()
             snapshots.append(
                 IterationSnapshot(
                     iteration=iteration,
                     iteration_dir=iteration_dir,
                     train_dir=train_dir if train_dir.is_dir() else None,
                     task=task,
+                    source_identity=f"{stat.st_dev}:{stat.st_ino}",
                 )
             )
             if iteration not in inspections:
@@ -130,7 +134,10 @@ class DpgenObserver:
                         iteration, task = map(int, parts)
                     except ValueError:
                         continue
-                    tasks[iteration] = max(task, tasks.get(iteration, task))
+                    # record.dpgen may be truncated and restarted from an older
+                    # stage during a recovery.  The last entry is authoritative;
+                    # taking max() would keep the superseded run forever.
+                    tasks[iteration] = task
         except OSError:
             return {}
         return tasks
@@ -159,6 +166,7 @@ class DpgenObserver:
         suspicious: set[int] = set()
         seen: set[int] = set()
         current_iter: int | None = None
+        latest_epoch_iter: int | None = None
 
         for line in lines:
             iter_match = ITER_RE.search(line)
@@ -167,14 +175,35 @@ class DpgenObserver:
             # iter.XXXXXX 把后续统计误归到其他迭代。
             is_stage_header = bool(task_match or re.search(r"[=-]{3,}", line))
             if iter_match and is_stage_header:
-                current_iter = int(iter_match.group(1))
+                next_iter = int(iter_match.group(1))
+                if latest_epoch_iter is not None and next_iter < latest_epoch_iter:
+                    # A lower iteration after a later one marks a run rollback.
+                    # Forget parsed data from the superseded tail of the log.
+                    for mapping in (tasks, stats_by_iter, ratios_by_iter):
+                        for iteration in tuple(mapping):
+                            if iteration >= next_iter:
+                                mapping.pop(iteration, None)
+                    suspicious.difference_update(
+                        {
+                            iteration
+                            for iteration in suspicious
+                            if iteration >= next_iter
+                        }
+                    )
+                    seen.difference_update(
+                        {iteration for iteration in seen if iteration >= next_iter}
+                    )
+                    latest_epoch_iter = next_iter
+                elif latest_epoch_iter is None or next_iter > latest_epoch_iter:
+                    latest_epoch_iter = next_iter
+                current_iter = next_iter
                 seen.add(current_iter)
             if current_iter is None:
                 continue
 
             if task_match:
                 task = int(task_match.group(1))
-                tasks[current_iter] = max(task, tasks.get(current_iter, task))
+                tasks[current_iter] = task
 
             clean = line.replace(",", "")
             system_match = SYSTEM_RE.search(clean)

@@ -33,6 +33,50 @@ absorption_ready_task = 2
 blind_spot_enabled = true
 blind_spot_ready_task = 8
 
+# 可选：新一轮训练完成后，用新委员会回放上一轮未进入 FP 的候选轨迹帧。
+# 默认关闭；启用后会执行 dp model-devi，可能需要 GPU。
+[committee_replay]
+enabled = false
+command = ["conda", "run", "-n", "deepmd", "dp"]
+# Agent 只能请求这个预注册 profile；命令和文件路径由 Controller 固定生成。
+executor_profile = "local_gpu"
+dispatcher_check_interval = 30
+cpu_per_node = 4
+gpu_device = 0
+# 单个回放请求的硬上限，防止 Agent 绕过每 task 抽样预算。
+max_total_frames = 2048
+model_ids = ["000", "001", "002", "003"]
+# 相对于 iter.N/00.train；DPA-4C/PT2 项目可改为 graph.{model_id}.pt2。
+model_pattern = "graph.{model_id}.pb"
+# iter.N 模型默认回放 iter.N-1；[1, 2] 可同时回放前两轮。
+# 参数建议只能使用紧邻上一轮；更早迭代应作为独立的历史回归评估。
+# 该文件由支持原子级 active-learning selection report 的 DP-GEN 生成；
+# 每行必须包含 task、step、非空 atom_index、model_deviation 和 selected。
+source_offsets = [1]
+candidate_manifest = "02.fp/candidate_selection.000.jsonl"
+exclude_selected = true
+max_frames_per_task = 256
+time_bins = 5
+seed = 20260905
+# 留空时优先读取各 model_devi task 的 dpa4c_offline.json。
+type_map = []
+relative = 1.0
+f_trust_lo = 0.15
+f_trust_hi = 0.30
+start_iteration = 1
+ready_task = 2
+
+# 可选：当 DP-GEN 因缺少下一项 model_devi_jobs 而停在 post_train 时，
+# 等委员会回放完成后生成 repeat_last 建议。只生成建议，不自动修改或恢复。
+[parameter_proposals]
+enabled = false
+parameter_file = "/path/to/dpgen/run/param.yaml"
+strategy = "repeat_last"
+start_iteration = 1
+required_task = 2
+# repeat_last 也不能超过这个硬上限。
+max_nsteps = 25000000
+
 [[notifications]]
 name = "terminal"
 type = "console"
