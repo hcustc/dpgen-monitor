@@ -236,18 +236,30 @@ class MonitorService:
                 source = by_iteration.get(source_iteration)
                 if source is None:
                     continue
-                event_key = self._committee_replay_event_key(
-                    model.iteration, source.iteration
-                )
                 row = self.state.get_committee_replay(
                     model.iteration, source.iteration
                 )
-                delivery_complete = all(
-                    self.state.is_delivered(event_key, notifier.name)
-                    for notifier in self.notifiers
-                )
-                if row and row["status"] == "complete" and delivery_complete:
-                    continue
+                if (
+                    row
+                    and row["status"] == "complete"
+                    and row["summary_file"]
+                ):
+                    completed = CommitteeReplayResult(
+                        model.iteration,
+                        source.iteration,
+                        "complete",
+                        Path(str(row["summary_file"])),
+                    )
+                    try:
+                        event = self._committee_replay_event(completed)
+                    except (KeyError, TypeError, ValueError):
+                        # Let the evaluator rebuild or report an invalid summary.
+                        pass
+                    else:
+                        if self._has_pending_delivery(event):
+                            completed_count += 1
+                            self._deliver(event, notify)
+                        continue
                 status_key = (
                     f"committee-replay:model.{model.iteration:06d}:"
                     f"source.{source.iteration:06d}"

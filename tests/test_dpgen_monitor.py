@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from dpgen_monitor.committee_replay import CommitteeReplayResult
 from dpgen_monitor.config import DpgenConfig, EvaluationConfig, load_config
 from dpgen_monitor.cli import _monitor_lock, build_parser
 from dpgen_monitor.dpgen import DpgenObserver, IterationSnapshot
@@ -655,6 +657,88 @@ class EvaluationPlotTests(unittest.TestCase):
 
 
 class ServiceLoggingTests(unittest.TestCase):
+    def test_changed_committee_replay_content_is_delivered_again(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            summary_file = root_path / "summary.json"
+            state = StateStore(root_path / "state.sqlite3")
+            service = object.__new__(MonitorService)
+            service.config = SimpleNamespace(
+                committee_replay=SimpleNamespace(
+                    start_iteration=2,
+                    source_offsets=(1,),
+                    ready_task=2,
+                )
+            )
+            service.state = state
+            service.notifiers = [SimpleNamespace(name="channel")]
+            service.replay_evaluator = SimpleNamespace(
+                evaluate=lambda model, source: self.fail(
+                    "a complete replay should be restored without rerunning"
+                )
+            )
+            service._stop_event = None
+            service._last_status = {}
+            model = IterationSnapshot(
+                2,
+                Path("/run/iter.000002"),
+                Path("/run/iter.000002/00.train"),
+                2,
+            )
+            source = IterationSnapshot(1, Path("/run/iter.000001"), None, 8)
+            summary = {
+                "frame_count": 1,
+                "tracked_candidates": 2,
+                "absorbed": 1,
+                "remaining_candidate": 1,
+                "worsened_to_failed": 0,
+                "absorption_percent": 50.0,
+                "candidate_percent": 25.0,
+                "failed_percent": 0.0,
+            }
+            try:
+                summary_file.write_text(json.dumps(summary), encoding="utf-8")
+                old_result = CommitteeReplayResult(
+                    2, 1, "complete", summary_file
+                )
+                old_event = service._committee_replay_event(old_result)
+                state.record_delivery(
+                    old_event.key,
+                    "channel",
+                    True,
+                    content_hash=old_event.content_hash,
+                )
+                state.set_committee_replay(2, 1, "complete", str(summary_file))
+
+                with patch.object(service, "_deliver") as unchanged_delivery:
+                    self.assertEqual(
+                        service._process_committee_replays(
+                            [source, model], notify=True
+                        ),
+                        0,
+                    )
+                unchanged_delivery.assert_not_called()
+
+                summary["absorbed"] = 2
+                summary["remaining_candidate"] = 0
+                summary["absorption_percent"] = 100.0
+                summary_file.write_text(json.dumps(summary), encoding="utf-8")
+                state.set_committee_replay(2, 1, "complete", str(summary_file))
+
+                with patch.object(service, "_deliver") as deliver:
+                    completed = service._process_committee_replays(
+                        [source, model], notify=True
+                    )
+
+                self.assertEqual(completed, 1)
+                delivered_event = deliver.call_args.args[0]
+                self.assertNotEqual(
+                    delivered_event.content_hash, old_event.content_hash
+                )
+                deliver.assert_called_once_with(delivered_event, True)
+            finally:
+                state.close()
+
     def test_cancelled_evaluation_does_not_send_failure_notification(self):
         service = object.__new__(MonitorService)
         service.config = SimpleNamespace(
