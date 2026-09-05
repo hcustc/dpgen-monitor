@@ -483,7 +483,11 @@ class EvaluatorTests(unittest.TestCase):
     def test_evaluator_passes_previous_iteration_data_to_dp_test(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
-            train_dir = root_path / "run" / "iter.000007" / "00.train"
+            real_run_dir = root_path / "real-run"
+            real_run_dir.mkdir()
+            run_dir = root_path / "run"
+            run_dir.symlink_to(real_run_dir, target_is_directory=True)
+            train_dir = run_dir / "iter.000007" / "00.train"
             model_path = train_dir / "000" / "frozen_model.pb"
             model_path.parent.mkdir(parents=True)
             model_path.write_text("model", encoding="utf-8")

@@ -157,7 +157,9 @@ class DeepMDEvaluator:
             / f"iter.{iteration - 1:06d}"
             / "00.train"
         )
-        model_path = previous_train_dir / model_id / self.config.model_file
+        model_path = (
+            previous_train_dir / model_id / self.config.model_file
+        ).resolve()
         iteration_output = self._iteration_output(iteration, generation) / "absorption"
         model_output = iteration_output / "baseline" / model_id
         force_output = model_output / f"{model_id}.f.out"
