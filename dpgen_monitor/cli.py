@@ -20,7 +20,7 @@ from .state import StateStore
 
 @contextmanager
 def _monitor_lock(output_dir: Path) -> Iterator[Path]:
-    """Prevent concurrent evaluators from sharing one state/output directory."""
+    """Serialize monitor and state-changing commands for one output directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = output_dir / "monitor.run.lock"
     handle = lock_path.open("a+", encoding="utf-8")
@@ -31,8 +31,8 @@ def _monitor_lock(output_dir: Path) -> Iterator[Path]:
             handle.seek(0)
             owner = handle.read().strip() or "未知进程"
             raise RuntimeError(
-                f"已有监控/评估进程正在运行（{owner}）；"
-                "请等待其显示‘程序已安全停止’后再启动"
+                f"已有监控/变更进程正在运行（{owner}）；"
+                "请等待其完成后再执行此命令"
             ) from exc
         handle.seek(0)
         handle.truncate()
@@ -116,16 +116,18 @@ def command_once(config_path: Path) -> int:
 
 
 def command_sync(config_path: Path) -> int:
-    service = MonitorService(load_config(config_path), enable_notifiers=False)
-    try:
-        summary = service.scan_once(evaluate=False, notify=False)
-        print(
-            "状态同步完成："
-            f"迭代 {summary['iterations']}，"
-            f"完整探索统计 {summary['statistics_ready']}"
-        )
-    finally:
-        service.close()
+    config = load_config(config_path)
+    with _monitor_lock(config.project.output_dir):
+        service = MonitorService(config, enable_notifiers=False)
+        try:
+            summary = service.scan_once(evaluate=False, notify=False)
+            print(
+                "状态同步完成："
+                f"迭代 {summary['iterations']}，"
+                f"完整探索统计 {summary['statistics_ready']}"
+            )
+        finally:
+            service.close()
     return 0
 
 
@@ -199,21 +201,27 @@ def _transition_proposal(
     config = load_config(config_path)
     if not config.parameter_proposals.enabled:
         raise ValueError("parameter_proposals 未启用")
-    store = StateStore(config.project.output_dir / "monitor.sqlite3")
-    try:
-        expected = ("pending",) if status == "approved" else ("pending", "approved")
-        proposal = store.transition_parameter_proposal(
-            proposal_id,
-            expected_statuses=expected,
-            status=status,
-            review_note=note,
-        )
-        print(
-            f"参数建议 {proposal['proposal_id']} 已{('批准' if status == 'approved' else '拒绝')}；"
-            "尚未修改 DP-GEN 参数，也未启动 DP-GEN。"
-        )
-    finally:
-        store.close()
+    with _monitor_lock(config.project.output_dir):
+        store = StateStore(config.project.output_dir / "monitor.sqlite3")
+        try:
+            expected = (
+                ("pending",)
+                if status == "approved"
+                else ("pending", "approved")
+            )
+            proposal = store.transition_parameter_proposal(
+                proposal_id,
+                expected_statuses=expected,
+                status=status,
+                review_note=note,
+            )
+            print(
+                f"参数建议 {proposal['proposal_id']} "
+                f"已{('批准' if status == 'approved' else '拒绝')}；"
+                "尚未修改 DP-GEN 参数，也未启动 DP-GEN。"
+            )
+        finally:
+            store.close()
     return 0
 
 
@@ -239,23 +247,24 @@ def command_apply(config_path: Path, proposal_id: str) -> int:
     config = load_config(config_path)
     if not config.parameter_proposals.enabled:
         raise ValueError("parameter_proposals 未启用")
-    store = StateStore(config.project.output_dir / "monitor.sqlite3")
-    try:
-        controller = ParameterFileController(
-            config.parameter_proposals,
-            config.dpgen,
-            config.project.run_dir,
-            store,
-        )
-        parameter_file, backup, changed = controller.apply(proposal_id)
-        if changed:
-            print(f"已追加 model_devi_jobs: {parameter_file}")
-            print(f"原文件备份: {backup}")
-        else:
-            print(f"参数建议已经应用，无需重复修改: {parameter_file}")
-        print("未启动 DP-GEN；请检查参数后再由人工恢复流程。")
-    finally:
-        store.close()
+    with _monitor_lock(config.project.output_dir):
+        store = StateStore(config.project.output_dir / "monitor.sqlite3")
+        try:
+            controller = ParameterFileController(
+                config.parameter_proposals,
+                config.dpgen,
+                config.project.run_dir,
+                store,
+            )
+            parameter_file, backup, changed = controller.apply(proposal_id)
+            if changed:
+                print(f"已追加 model_devi_jobs: {parameter_file}")
+                print(f"原文件备份: {backup}")
+            else:
+                print(f"参数建议已经应用，无需重复修改: {parameter_file}")
+            print("未启动 DP-GEN；请检查参数后再由人工恢复流程。")
+        finally:
+            store.close()
     return 0
 
 

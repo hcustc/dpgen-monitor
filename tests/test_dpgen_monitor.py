@@ -52,7 +52,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             output_dir = Path(root)
             with _monitor_lock(output_dir):
-                with self.assertRaisesRegex(RuntimeError, "已有监控/评估进程"):
+                with self.assertRaisesRegex(RuntimeError, "已有监控/变更进程"):
                     with _monitor_lock(output_dir):
                         self.fail("第二个评估器不应获得锁")
 
@@ -529,16 +529,16 @@ class EvaluatorTests(unittest.TestCase):
                     results = evaluator.evaluate_iteration(snapshot)
 
                 self.assertEqual(results[0].status, "complete")
-                self.assertEqual(results[0].test_data, previous_data)
+                self.assertEqual(results[0].test_data, previous_data.resolve())
                 self.assertIsNotNone(results[0].baseline_force_file)
                 self.assertEqual(len(commands), 2)
                 self.assertEqual(
                     Path(commands[0][commands[0].index("-s") + 1]),
-                    previous_data,
+                    previous_data.resolve(),
                 )
                 self.assertEqual(
                     Path(commands[1][commands[1].index("-m") + 1]),
-                    previous_model_path,
+                    previous_model_path.resolve(),
                 )
             finally:
                 state.close()

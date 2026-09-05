@@ -6,9 +6,11 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import threading
 from typing import Any, Iterable
+from uuid import uuid4
 
 import numpy as np
 
@@ -224,8 +226,12 @@ def select_replay_frames(
         )
     selected.sort(key=lambda item: (item.task, item.step))
     if not selected:
-        reason = "未找到未入选候选" if config.exclude_selected else "候选清单为空"
-        raise ValueError(f"{manifest}: {reason}")
+        reason = (
+            "等待未入选候选"
+            if config.exclude_selected
+            else "等待候选清单产生候选"
+        )
+        raise ValueError(f"{reason}: {manifest}")
     missing = [frame.trajectory for frame in selected if not frame.trajectory.is_file()]
     if missing:
         preview = ", ".join(str(path) for path in missing[:3])
@@ -429,7 +435,7 @@ def build_replay_dataset(
     names = _infer_type_map(frames, type_map)
     if names and int(np.max(atom_types)) >= len(names):
         raise ValueError("type_map 无法覆盖轨迹中的原子类型")
-    temporary = dataset.with_name(f".{dataset.name}.tmp-{os.getpid()}")
+    temporary = dataset.with_name(f".{dataset.name}.tmp-{uuid4().hex}")
     shutil.rmtree(temporary, ignore_errors=True)
     try:
         set_dir = temporary / "set.000"
@@ -458,13 +464,30 @@ def build_replay_dataset(
         "frames": rendered_frames,
     }
     temporary_manifest = manifest_path.with_name(
-        f".{manifest_path.name}.tmp-{os.getpid()}"
+        f".{manifest_path.name}.tmp-{uuid4().hex}"
     )
-    temporary_manifest.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    os.replace(temporary_manifest, manifest_path)
+    try:
+        temporary_manifest.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_manifest, manifest_path)
+    finally:
+        temporary_manifest.unlink(missing_ok=True)
     return manifest
+
+
+def _atomic_deviation_column(columns: list[str]) -> int | None:
+    for index, column in enumerate(columns):
+        normalized = column.casefold()
+        if normalized in {"atm_devi_f(n)", "atomic_devi_f(n)"}:
+            return index
+        if re.fullmatch(
+            r"(?:atm_|atomic_)?devi_f(?:_0|\[0\]|\(0\))",
+            normalized,
+        ):
+            return index
+    return None
 
 
 def summarize_replay_output(
@@ -477,18 +500,35 @@ def summarize_replay_output(
     frames = holdout["frames"]
     natoms = int(holdout["atom_count"])
     rows: list[list[float]] = []
+    atomic_column: int | None = None
     with output.open(encoding="utf-8", errors="replace") as handle:
         for line_number, line in enumerate(handle, start=1):
-            if not line.strip() or line.lstrip().startswith("#"):
+            if not line.strip():
                 continue
+            if line.lstrip().startswith("#"):
+                columns = line.lstrip()[1:].split()
+                detected = _atomic_deviation_column(columns)
+                if detected is not None:
+                    if atomic_column is not None and detected != atomic_column:
+                        raise ValueError(
+                            "model deviation 输出包含不一致的原子偏差 header"
+                        )
+                    atomic_column = detected
+                continue
+            if atomic_column is None:
+                raise ValueError(
+                    "model deviation 输出缺少 atm_devi_f(N) 原子偏差 header"
+                )
             try:
                 values = [float(value) for value in line.split()]
             except ValueError as exc:
                 raise ValueError(f"model deviation 输出包含非数值: {output}:{line_number}") from exc
-            if len(values) not in {7 + natoms, 8 + natoms}:
+            expected_columns = atomic_column + natoms
+            if len(values) != expected_columns:
                 raise ValueError(
                     f"model deviation 列数错误: {output}:{line_number}: "
-                    f"{len(values)}，期待 {7 + natoms} 或 {8 + natoms}"
+                    f"{len(values)}，根据 header 和 {natoms} 个原子期待 "
+                    f"{expected_columns}"
                 )
             rows.append(values)
     if len(rows) != len(frames):
@@ -500,7 +540,10 @@ def summarize_replay_output(
     all_accurate = all_candidate = all_failed = 0
     per_task: dict[str, dict[str, Any]] = {}
     for metadata, values in zip(frames, rows):
-        atomic = np.asarray(values[-natoms:], dtype=float)
+        assert atomic_column is not None
+        atomic = np.asarray(
+            values[atomic_column : atomic_column + natoms], dtype=float
+        )
         if not np.all(np.isfinite(atomic)):
             raise ValueError("model deviation 输出包含非有限原子偏差")
         accurate_mask = atomic < f_trust_lo
@@ -713,12 +756,17 @@ class CommitteeReplayEvaluator:
                     "executor_profile": self.config.executor_profile,
                 }
             )
-            temporary = summary_file.with_name(f".{summary_file.name}.tmp-{os.getpid()}")
-            temporary.write_text(
-                json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
+            temporary = summary_file.with_name(
+                f".{summary_file.name}.tmp-{uuid4().hex}"
             )
-            os.replace(temporary, summary_file)
+            try:
+                temporary.write_text(
+                    json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(temporary, summary_file)
+            finally:
+                temporary.unlink(missing_ok=True)
             self.state.set_committee_replay(
                 *identity, "complete", str(summary_file), None
             )

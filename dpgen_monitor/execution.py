@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shlex
 from typing import Any
+from uuid import uuid4
 
 from .config import CommitteeReplayConfig
 
@@ -152,12 +153,15 @@ class ReplaySubmissionController:
 
     @staticmethod
     def _write_json(path: Path, payload: dict[str, Any]) -> None:
-        temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
+        temporary = path.with_name(f".{path.name}.tmp-{uuid4().hex}")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def submit(self, request: CommitteeReplayRequest) -> ExecutionResult:
         self.validate(request)

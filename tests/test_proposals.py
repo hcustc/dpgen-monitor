@@ -2,11 +2,20 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import yaml
 
-from dpgen_monitor.cli import build_parser
+from dpgen_monitor.cli import (
+    _monitor_lock,
+    build_parser,
+    command_apply,
+    command_approve,
+    command_reject,
+    command_sync,
+)
 from dpgen_monitor.config import (
     CommitteeReplayConfig,
     DpgenConfig,
@@ -38,6 +47,18 @@ model_devi_jobs:
 fp_style: gaussian
 fp_task_max: 10
 """
+
+
+def proposal_evidence(
+    *, model_generation: int = 0, source_generation: int = 0
+) -> list[dict]:
+    return [
+        {
+            "source_iteration": 1,
+            "model_generation": model_generation,
+            "source_generation": source_generation,
+        }
+    ]
 
 
 def write_replay_summary(
@@ -141,6 +162,29 @@ class ParameterProposalTests(unittest.TestCase):
         apply = parser.parse_args(["apply", "config.toml", "proposal-1"])
         self.assertEqual(approve.command, "approve")
         self.assertEqual(apply.command, "apply")
+
+    def test_state_changing_cli_commands_share_monitor_lock(self):
+        with tempfile.TemporaryDirectory() as root:
+            output_dir = Path(root) / "output"
+            config = SimpleNamespace(
+                project=SimpleNamespace(output_dir=output_dir),
+                parameter_proposals=SimpleNamespace(enabled=True),
+            )
+            commands = (
+                lambda: command_sync(Path("config.toml")),
+                lambda: command_approve(Path("config.toml"), "proposal", None),
+                lambda: command_reject(Path("config.toml"), "proposal", None),
+                lambda: command_apply(Path("config.toml"), "proposal"),
+            )
+
+            with patch("dpgen_monitor.cli.load_config", return_value=config):
+                with _monitor_lock(output_dir):
+                    for command in commands:
+                        with self.subTest(command=command):
+                            with self.assertRaisesRegex(
+                                RuntimeError, "已有监控/变更进程"
+                            ):
+                                command()
 
     def test_advisor_waits_for_gate_and_previous_replay_then_repeats_last_job(self):
         with tempfile.TemporaryDirectory() as root:
@@ -303,7 +347,7 @@ class ParameterProposalTests(unittest.TestCase):
                 parameter_sha256=hashlib.sha256(original.encode()).hexdigest(),
                 strategy="repeat_last",
                 proposed_job=proposed_job,
-                evidence=[],
+                evidence=proposal_evidence(),
             )
             controller = ParameterFileController(
                 config,
@@ -323,7 +367,7 @@ class ParameterProposalTests(unittest.TestCase):
                 path, backup, changed = controller.apply(proposal_id)
 
                 self.assertTrue(changed)
-                self.assertEqual(path, parameter_file)
+                self.assertEqual(path, parameter_file.resolve())
                 self.assertIsNotNone(backup)
                 self.assertEqual(backup.read_text(encoding="utf-8"), original)
                 rendered = parameter_file.read_text(encoding="utf-8")
@@ -374,7 +418,7 @@ class ParameterProposalTests(unittest.TestCase):
                 parameter_sha256=original_hash,
                 strategy="repeat_last",
                 proposed_job=job,
-                evidence=[],
+                evidence=proposal_evidence(),
             )
             parameter_file.write_text(PARAMETER_TEXT + "# external edit\n")
             controller = ParameterFileController(
@@ -421,7 +465,7 @@ class ParameterProposalTests(unittest.TestCase):
                     "ensemble": "nvt",
                     "_idx": 2,
                 },
-                evidence=[],
+                evidence=proposal_evidence(),
             )
             controller = ParameterFileController(
                 ParameterProposalConfig(
@@ -440,6 +484,82 @@ class ParameterProposalTests(unittest.TestCase):
                 self.assertEqual(
                     parameter_file.read_text(encoding="utf-8"),
                     PARAMETER_TEXT,
+                )
+            finally:
+                state.close()
+
+    def test_apply_rejects_stale_generation_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            run_dir = root_path / "run"
+            run_dir.mkdir()
+            parameter_file = run_dir / "param.yaml"
+            parameter_file.write_text(PARAMETER_TEXT, encoding="utf-8")
+            (run_dir / "record.dpgen").write_text("2 2\n", encoding="utf-8")
+            train_dir = run_dir / "iter.000002" / "00.train"
+            train_dir.mkdir(parents=True)
+            state = StateStore(root_path / "output" / "monitor.sqlite3")
+            source = IterationSnapshot(
+                1,
+                run_dir / "iter.000001",
+                None,
+                8,
+                source_identity="source-current",
+            )
+            old_model = IterationSnapshot(
+                2,
+                train_dir.parent,
+                train_dir,
+                2,
+                source_identity="model-old",
+            )
+            new_model = IterationSnapshot(
+                2,
+                train_dir.parent,
+                train_dir,
+                2,
+                source_identity="model-new",
+            )
+            try:
+                state.reconcile_iterations([source, old_model])
+                state.reconcile_iterations([source, new_model])
+                self.assertEqual(state.get_iteration_generation(2), 1)
+                state.create_parameter_proposal(
+                    proposal_id="stale-generation",
+                    target_iteration=2,
+                    status="approved",
+                    parameter_file=str(parameter_file),
+                    parameter_sha256=hashlib.sha256(
+                        parameter_file.read_bytes()
+                    ).hexdigest(),
+                    strategy="repeat_last",
+                    proposed_job={
+                        "sys_idx": [0],
+                        "temps": [2500, 3000],
+                        "trj_freq": 1000,
+                        "nsteps": 2_000_000,
+                        "ensemble": "nvt",
+                        "_idx": 2,
+                    },
+                    evidence=proposal_evidence(model_generation=0),
+                )
+                controller = ParameterFileController(
+                    ParameterProposalConfig(
+                        enabled=True,
+                        parameter_file=parameter_file,
+                        required_task=2,
+                        max_nsteps=2_000_000,
+                    ),
+                    DpgenConfig(),
+                    run_dir,
+                    state,
+                )
+
+                with self.assertRaisesRegex(ValueError, "generation 已变化"):
+                    controller.apply("stale-generation")
+
+                self.assertEqual(
+                    parameter_file.read_text(encoding="utf-8"), PARAMETER_TEXT
                 )
             finally:
                 state.close()

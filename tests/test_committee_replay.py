@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import tempfile
+import threading
 import tomllib
 from types import SimpleNamespace
 import unittest
@@ -217,8 +218,9 @@ class CommitteeReplayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             output = Path(root) / "model_devi.out"
             output.write_text(
-                "# header\n"
-                "0 0 0 0 0 0 0 0.10 0.20\n"
+                "# step max_devi_v min_devi_v avg_devi_v max_devi_f "
+                "min_devi_f avg_devi_f devi_e atm_devi_f(N)\n"
+                "0 0 0 0 0 0 0 0 0.10 0.20\n"
                 "1 0 0 0 0 0 0 0 0.31 0.16\n",
                 encoding="utf-8",
             )
@@ -248,6 +250,166 @@ class CommitteeReplayTests(unittest.TestCase):
             self.assertEqual(summary["all_atom_candidate"], 2)
             self.assertEqual(summary["all_atom_failed"], 1)
             self.assertAlmostEqual(summary["absorption_percent"], 50.0)
+
+    def test_summary_finds_atomic_columns_from_header(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "model_devi.out"
+            output.write_text(
+                "# step future_metric another_metric atm_devi_f(N)\n"
+                "0 12 34 0.10 0.31\n",
+                encoding="utf-8",
+            )
+            holdout = {
+                "atom_count": 2,
+                "frames": [
+                    {
+                        "task": "task.0",
+                        "temperature": 2500,
+                        "candidates": [],
+                    }
+                ],
+            }
+
+            summary = summarize_replay_output(
+                output, holdout, f_trust_lo=0.15, f_trust_hi=0.30
+            )
+
+            self.assertEqual(summary["all_atom_accurate"], 1)
+            self.assertEqual(summary["all_atom_failed"], 1)
+
+    def test_summary_rejects_missing_atomic_header(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "model_devi.out"
+            output.write_text("# unknown format\n0 0.10 0.20\n", encoding="utf-8")
+            holdout = {
+                "atom_count": 2,
+                "frames": [{"task": "task.0", "candidates": []}],
+            }
+
+            with self.assertRaisesRegex(ValueError, "原子偏差 header"):
+                summarize_replay_output(
+                    output, holdout, f_trust_lo=0.15, f_trust_hi=0.30
+                )
+
+    def test_summary_rejects_nonfinite_atomic_deviation(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "model_devi.out"
+            output.write_text(
+                "# step atm_devi_f(N)\n0 nan\n", encoding="utf-8"
+            )
+            holdout = {
+                "atom_count": 1,
+                "frames": [{"task": "task.0", "candidates": []}],
+            }
+
+            with self.assertRaisesRegex(ValueError, "非有限原子偏差"):
+                summarize_replay_output(
+                    output, holdout, f_trust_lo=0.15, f_trust_hi=0.30
+                )
+
+    def test_evaluator_treats_empty_unselected_holdout_as_waiting(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            run_dir = root_path / "run"
+            source_dir = run_dir / "iter.000001"
+            task = "task.000.000000"
+            write_candidate_manifest(
+                run_dir,
+                1,
+                [
+                    {
+                        "task": f"iter.000001/01.model_devi/{task}",
+                        "step": 100,
+                        "atom_index": 0,
+                        "model_deviation": 0.2,
+                        "selected": True,
+                    }
+                ],
+            )
+            output_dir = root_path / "output"
+            state = StateStore(output_dir / "monitor.sqlite3")
+            evaluator = CommitteeReplayEvaluator(
+                CommitteeReplayConfig(enabled=True),
+                run_dir,
+                output_dir,
+                state,
+            )
+            model = IterationSnapshot(
+                2,
+                run_dir / "iter.000002",
+                run_dir / "iter.000002" / "00.train",
+                2,
+            )
+            source = IterationSnapshot(1, source_dir, None, 8)
+            try:
+                result = evaluator.evaluate(model, source)
+
+                self.assertEqual(result.status, "waiting")
+                self.assertIn("等待未入选候选", result.error)
+                self.assertEqual(
+                    state.get_committee_replay(2, 1)["status"], "waiting"
+                )
+            finally:
+                state.close()
+
+    def test_evaluator_honors_cancellation_before_submission(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            run_dir = root_path / "run"
+            source_dir = run_dir / "iter.000001"
+            task = "task.000.000000"
+            write_dump(
+                source_dir / "01.model_devi" / task / "traj" / "100.lammpstrj",
+                100,
+            )
+            write_candidate_manifest(
+                run_dir,
+                1,
+                [
+                    {
+                        "task": f"iter.000001/01.model_devi/{task}",
+                        "step": 100,
+                        "atom_index": 0,
+                        "model_deviation": 0.2,
+                        "selected": False,
+                    }
+                ],
+            )
+            train_dir = run_dir / "iter.000002" / "00.train"
+            train_dir.mkdir(parents=True)
+            for model_id in ("000", "001"):
+                (train_dir / f"graph.{model_id}.pb").write_text("model")
+            output_dir = root_path / "output"
+            state = StateStore(output_dir / "monitor.sqlite3")
+            stop_event = threading.Event()
+            stop_event.set()
+            evaluator = CommitteeReplayEvaluator(
+                CommitteeReplayConfig(
+                    enabled=True,
+                    model_ids=("000", "001"),
+                    model_pattern="graph.{model_id}.pb",
+                    type_map=("C", "H"),
+                ),
+                run_dir,
+                output_dir,
+                state,
+                stop_event,
+            )
+            model = IterationSnapshot(2, train_dir.parent, train_dir, 2)
+            source = IterationSnapshot(1, source_dir, None, 8)
+            try:
+                with patch.object(
+                    evaluator.submission_controller, "submit"
+                ) as submit:
+                    result = evaluator.evaluate(model, source)
+
+                self.assertEqual(result.status, "cancelled")
+                submit.assert_not_called()
+                self.assertEqual(
+                    state.get_committee_replay(2, 1)["status"], "cancelled"
+                )
+            finally:
+                state.close()
 
     def test_evaluator_runs_one_committee_command_and_persists_result(self):
         with tempfile.TemporaryDirectory() as root:
@@ -291,7 +453,12 @@ class CommitteeReplayTests(unittest.TestCase):
             def fake_submit(request):
                 requests.append(request)
                 output = request.deviation_file
-                output.write_text("0 0 0 0 0 0 0 0.10 0.20\n", encoding="utf-8")
+                output.write_text(
+                    "# step max_devi_v min_devi_v avg_devi_v max_devi_f "
+                    "min_devi_f avg_devi_f devi_e atm_devi_f(N)\n"
+                    "0 0 0 0 0 0 0 0 0.10 0.20\n",
+                    encoding="utf-8",
+                )
                 return ExecutionResult(("dp", "model-devi"))
 
             try:

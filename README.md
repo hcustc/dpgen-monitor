@@ -22,6 +22,7 @@ Configurable monitoring, DeepMD evaluation, plotting, and notifications for comp
 ## Requirements
 
 - Python 3.11 or newer
+- A POSIX-compatible operating system for process and parameter-file locking
 - A working DeepMD command for model evaluation
 - An existing DP-GEN run directory
 - Committee replay additionally requires a DP-GEN build or preprocessing step

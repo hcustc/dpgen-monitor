@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 from typing import Any, Iterator
+from uuid import uuid4
 
 import yaml
 
@@ -332,6 +334,44 @@ class ParameterFileController:
         if (iteration_dir / "01.model_devi").exists():
             raise ValueError("目标迭代已经存在 01.model_devi，拒绝追加参数")
 
+    def _assert_current_generations(self, proposal: dict[str, Any]) -> None:
+        target_iteration = int(proposal["target_iteration"])
+        evidence = proposal.get("evidence")
+        if not isinstance(evidence, list) or len(evidence) != 1:
+            raise ValueError("参数建议缺少 generation 证据，拒绝应用")
+        current_model_generation = self.state.get_iteration_generation(
+            target_iteration
+        )
+        for index, item in enumerate(evidence):
+            if not isinstance(item, dict):
+                raise ValueError(f"参数建议 evidence[{index}] 格式无效")
+            source_iteration = item.get("source_iteration")
+            model_generation = item.get("model_generation")
+            source_generation = item.get("source_generation")
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in (
+                    source_iteration,
+                    model_generation,
+                    source_generation,
+                )
+            ):
+                raise ValueError(f"参数建议 evidence[{index}] generation 无效")
+            if source_iteration != target_iteration - 1:
+                raise ValueError("参数建议 evidence 来源不是目标迭代的上一轮")
+            current_source_generation = self.state.get_iteration_generation(
+                source_iteration
+            )
+            if (
+                model_generation != current_model_generation
+                or source_generation != current_source_generation
+            ):
+                raise ValueError(
+                    "DP-GEN 迭代 generation 已变化；参数建议已经过期，拒绝应用"
+                )
+
     @staticmethod
     def _render_job(job: dict[str, Any]) -> str:
         return (
@@ -390,6 +430,7 @@ class ParameterFileController:
         proposed_job = proposal["proposed_job"]
 
         with self._parameter_lock():
+            self._assert_current_generations(proposal)
             source = self.parameter_file.read_text(encoding="utf-8")
             data, jobs = _load_parameter_data(self.parameter_file)
             if len(jobs) == target_iteration + 1 and jobs[-1] == proposed_job:
@@ -441,11 +482,14 @@ class ParameterFileController:
             )
             shutil.copy2(self.parameter_file, backup)
             temporary = self.parameter_file.with_name(
-                f".{self.parameter_file.name}.tmp-{os.getpid()}"
+                f".{self.parameter_file.name}.tmp-{uuid4().hex}"
             )
             try:
                 temporary.write_text(rendered, encoding="utf-8")
-                os.chmod(temporary, self.parameter_file.stat().st_mode)
+                os.chmod(
+                    temporary,
+                    stat.S_IMODE(self.parameter_file.stat().st_mode),
+                )
                 os.replace(temporary, self.parameter_file)
             finally:
                 temporary.unlink(missing_ok=True)
